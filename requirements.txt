@@ -1,0 +1,12 @@
+crewai
+crewai[tools]
+langchain-groq
+python-dotenv
+moviepy
+SpeechRecognition
+pydub
+elevenlabs
+fastapi
+uvicorn
+gunicorn
+python-multipart
