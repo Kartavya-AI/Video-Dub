@@ -4,17 +4,24 @@ import logging
 import tempfile
 import asyncio
 import uuid
+import aiofiles
 from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import defaultdict, deque
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 import structlog
+
 from src.video_dubbing.crew import create_crew
 
+# Configure structured logging with better performance
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -34,7 +41,14 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+# Enhanced task storage with TTL and cleanup
 task_storage: Dict[str, Dict[str, Any]] = {}
+task_cleanup_queue = deque()
+MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
+TASK_TTL = int(os.getenv("TASK_TTL_SECONDS", "3600"))  # 1 hour
+
+# Thread pool for CPU-intensive operations
+thread_pool = ThreadPoolExecutor(max_workers=int(os.getenv("MAX_WORKERS", "4")))
 
 class DubbingRequest(BaseModel):
     target_language: str = Field(default="Hindi", description="Target language for dubbing")
@@ -54,9 +68,46 @@ class TaskStatus(BaseModel):
     completed_at: Optional[str] = None
     error_message: Optional[str] = None
 
+async def cleanup_expired_tasks():
+    """Background task to clean up expired tasks"""
+    while True:
+        try:
+            current_time = time.time()
+            expired_tasks = []
+            
+            for task_id, task_data in task_storage.items():
+                if current_time - task_data.get("created_at", 0) > TASK_TTL:
+                    expired_tasks.append(task_id)
+            
+            for task_id in expired_tasks:
+                await cleanup_task_files(task_id)
+                del task_storage[task_id]
+                logger.info("Cleaned up expired task", task_id=task_id)
+            
+            await asyncio.sleep(300)  # Check every 5 minutes
+        except Exception as e:
+            logger.error("Error in cleanup task", error=str(e))
+            await asyncio.sleep(60)
+
+async def cleanup_task_files(task_id: str):
+    """Cleanup files associated with a task"""
+    try:
+        task_temp_dir = Path("/tmp/video_dubbing") / task_id
+        if task_temp_dir.exists():
+            shutil.rmtree(task_temp_dir)
+        
+        # Cleanup output file if exists
+        output_path = Path("/tmp/video_dubbing") / f"{task_id}_dubbed.mp4"
+        if output_path.exists():
+            output_path.unlink()
+    except Exception as e:
+        logger.warning("Error cleaning up task files", task_id=task_id, error=str(e))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Video Dubbing API", version="1.0.0")
+    logger.info("Starting Video Dubbing API", version="2.0.0")
+    
+    # Validate environment variables
     required_env_vars = ["ELEVENLABS_API_KEY"]
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
     
@@ -64,11 +115,20 @@ async def lifespan(app: FastAPI):
         logger.error("Missing required environment variables", missing_vars=missing_vars)
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing_vars)}")
     
-
+    # Create temp directory
     temp_dir = Path("/tmp/video_dubbing")
     temp_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Start cleanup task
+    cleanup_task = asyncio.create_task(cleanup_expired_tasks())
+    
     logger.info("Video Dubbing API started successfully")
     yield
+    
+    # Cleanup on shutdown
+    cleanup_task.cancel()
+    thread_pool.shutdown(wait=True)
+    
     logger.info("Shutting down Video Dubbing API")
     try:
         if temp_dir.exists():
@@ -79,13 +139,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Video Dubbing API",
-    description="AI-powered video dubbing service using CrewAI and ElevenLabs",
-    version="1.0.0",
+    description="AI-powered video dubbing service using CrewAI and ElevenLabs (Optimized)",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
 )
 
+# Optimized middleware configuration
 app.add_middleware(
     TrustedHostMiddleware, 
     allowed_hosts=["*"]
@@ -125,56 +186,95 @@ async def general_exception_handler(request, exc):
         content={"error": "Internal server error", "status_code": 500}
     )
 
-def validate_video_file(file: UploadFile) -> None:
+async def validate_video_file(file: UploadFile) -> None:
+    """Async file validation with streaming checks"""
     if not file.content_type or not file.content_type.startswith("video/"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid file type: {file.content_type}. Please upload a video file."
         )
-    max_size = 100 * 1024 * 1024
+    
+    # Check file size if available
+    max_size = 100 * 1024 * 1024  # 100MB
     if hasattr(file, 'size') and file.size and file.size > max_size:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="File too large. Maximum size allowed is 100MB."
         )
 
+async def stream_upload_file(file: UploadFile, destination: Path) -> None:
+    """Async streaming file upload to reduce memory usage"""
+    try:
+        async with aiofiles.open(destination, "wb") as f:
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while chunk := await file.read(chunk_size):
+                await f.write(chunk)
+    finally:
+        await file.close()
+
+def run_crew_sync(video_path: str, target_language: str) -> str:
+    """Synchronous crew execution to run in thread pool"""
+    crew = create_crew()
+    inputs = {
+        'video_path': video_path,
+        'target_language': target_language
+    }
+    
+    result = crew.kickoff(inputs=inputs)
+    if hasattr(result, 'raw'):
+        return result.raw.strip()
+    else:
+        return str(result).strip()
+
 async def process_dubbing_task(
     task_id: str,
     video_path: Path,
     target_language: str
 ) -> None:
+    """Optimized async dubbing process"""
     try:
         logger.info("Starting dubbing process", task_id=task_id, target_language=target_language)
+        
+        # Update task status
         task_storage[task_id].update({
             "status": "processing",
             "message": "Processing video for dubbing...",
             "progress": 10
         })
-        crew = create_crew()
-        inputs = {
-            'video_path': str(video_path),
-            'target_language': target_language
-        }
         
+        # Run CPU-intensive crew work in thread pool
         logger.info("Running crew for video dubbing", task_id=task_id)
-        task_storage[task_id]["progress"] = 50
+        task_storage[task_id]["progress"] = 30
         
-        result = crew.kickoff(inputs=inputs)
-        if hasattr(result, 'raw'):
-            output_path = result.raw.strip()
-        else:
-            output_path = str(result).strip()
+        # Execute crew in thread pool to avoid blocking event loop
+        output_path = await asyncio.get_event_loop().run_in_executor(
+            thread_pool,
+            run_crew_sync,
+            str(video_path),
+            target_language
+        )
+        
+        task_storage[task_id]["progress"] = 80
+        
+        # Verify output file exists
         if not Path(output_path).exists():
             raise FileNotFoundError(f"Dubbed video file not created: {output_path}")
+        
+        # Move to final location asynchronously
         final_output_path = Path("/tmp/video_dubbing") / f"{task_id}_dubbed.mp4"
-        shutil.move(output_path, final_output_path)
+        await asyncio.get_event_loop().run_in_executor(
+            thread_pool,
+            shutil.move,
+            output_path,
+            str(final_output_path)
+        )
 
         task_storage[task_id].update({
             "status": "completed",
             "message": "Video dubbing completed successfully",
             "progress": 100,
             "output_path": str(final_output_path),
-            "completed_at": str(asyncio.get_event_loop().time())
+            "completed_at": time.time()
         })
         
         logger.info("Dubbing process completed successfully", task_id=task_id)
@@ -185,32 +285,39 @@ async def process_dubbing_task(
             "status": "failed",
             "message": f"Dubbing failed: {str(e)}",
             "error_message": str(e),
-            "completed_at": str(asyncio.get_event_loop().time())
+            "completed_at": time.time()
         })
 
 @app.get("/", summary="Health Check")
 async def health_check():
+    """Fast health check endpoint"""
     return {
         "status": "ok",
         "service": "Video Dubbing API",
-        "version": "1.0.0",
-        "timestamp": asyncio.get_event_loop().time()
+        "version": "2.0.0",
+        "timestamp": time.time()
     }
 
 @app.get("/health", summary="Detailed Health Check")
 async def detailed_health_check():
+    """Detailed health check with system info"""
     env_status = {}
     required_vars = ["ELEVENLABS_API_KEY"]
     
     for var in required_vars:
         env_status[var] = "configured" if os.getenv(var) else "missing"
+    
+    processing_tasks = len([t for t in task_storage.values() if t["status"] == "processing"])
+    
     return {
         "status": "healthy",
         "service": "Video Dubbing API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "environment": env_status,
-        "active_tasks": len([t for t in task_storage.values() if t["status"] == "processing"]),
-        "total_tasks": len(task_storage)
+        "active_tasks": processing_tasks,
+        "total_tasks": len(task_storage),
+        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+        "available_workers": thread_pool._max_workers - len(thread_pool._threads)
     }
 
 @app.post("/dub-video", response_model=DubbingResponse, summary="Upload and Process Video for Dubbing")
@@ -219,31 +326,46 @@ async def start_dubbing_task(
     target_language: str = Form("Hindi"),
     video_file: UploadFile = File(...)
 ):
-
-    validate_video_file(video_file)
+    """Optimized video upload and dubbing initiation"""
+    
+    # Check concurrent task limit
+    processing_tasks = len([t for t in task_storage.values() if t["status"] == "processing"])
+    if processing_tasks >= MAX_CONCURRENT_TASKS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Maximum concurrent tasks ({MAX_CONCURRENT_TASKS}) reached. Please try again later."
+        )
+    
+    # Validate file
+    await validate_video_file(video_file)
+    
+    # Generate task ID and create directory
     task_id = str(uuid.uuid4())
     task_temp_dir = Path("/tmp/video_dubbing") / task_id
     task_temp_dir.mkdir(parents=True, exist_ok=True)
     input_video_path = task_temp_dir / f"input_{video_file.filename}"
+    
     try:
-        with open(input_video_path, "wb") as buffer:
-            shutil.copyfileobj(video_file.file, buffer)
+        # Stream upload file asynchronously
+        await stream_upload_file(video_file, input_video_path)
         
         logger.info(
             "Video uploaded successfully",
             task_id=task_id,
             filename=video_file.filename,
-            target_language=target_language
+            target_language=target_language,
+            file_size=input_video_path.stat().st_size
         )
         
     except Exception as e:
         logger.error("Failed to save uploaded video", task_id=task_id, error=str(e))
+        await cleanup_task_files(task_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save uploaded video"
         )
-    finally:
-        video_file.file.close()
+    
+    # Store task info
     task_storage[task_id] = {
         "task_id": task_id,
         "status": "pending",
@@ -251,9 +373,10 @@ async def start_dubbing_task(
         "progress": 0,
         "target_language": target_language,
         "filename": video_file.filename,
-        "created_at": str(asyncio.get_event_loop().time())
+        "created_at": time.time()
     }
     
+    # Start background processing
     background_tasks.add_task(
         process_dubbing_task,
         task_id,
@@ -264,11 +387,12 @@ async def start_dubbing_task(
     return DubbingResponse(
         task_id=task_id,
         status="pending",
-        message="Video dubbing task started. Use /task-status/{task_id} to check progress."
+        message=f"Video dubbing task started. Use /task-status/{task_id} to check progress."
     )
 
 @app.get("/task-status/{task_id}", response_model=TaskStatus, summary="Get Task Status")
 async def get_task_status(task_id: str):
+    """Fast task status lookup"""
     if task_id not in task_storage:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -280,6 +404,7 @@ async def get_task_status(task_id: str):
 
 @app.get("/download/{task_id}", summary="Download Dubbed Video")
 async def download_dubbed_video(task_id: str):
+    """Optimized file download with streaming"""
     if task_id not in task_storage:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -302,52 +427,92 @@ async def download_dubbed_video(task_id: str):
             detail="Dubbed video file not found"
         )
     
-    return FileResponse(
-        path=str(output_path),
+    # Use streaming response for large files
+    def generate_file():
+        with open(output_path, "rb") as f:
+            while chunk := f.read(8192):  # 8KB chunks
+                yield chunk
+    
+    file_size = output_path.stat().st_size
+    filename = f"dubbed_{task_data['filename']}"
+    
+    return StreamingResponse(
+        generate_file(),
         media_type='video/mp4',
-        filename=f"dubbed_{task_data['filename']}",
-        headers={"Content-Disposition": f"attachment; filename=dubbed_{task_data['filename']}"}
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Length": str(file_size)
+        }
     )
 
 @app.delete("/task/{task_id}", summary="Cancel or Delete Task")
 async def delete_task(task_id: str):
+    """Async task deletion with proper cleanup"""
     if task_id not in task_storage:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found"
         )
     
-    task_data = task_storage[task_id]
-    task_temp_dir = Path("/tmp/video_dubbing") / task_id
-    if task_temp_dir.exists():
-        shutil.rmtree(task_temp_dir)
+    # Cleanup files asynchronously
+    await cleanup_task_files(task_id)
     
-    if "output_path" in task_data:
-        output_path = Path(task_data["output_path"])
-        if output_path.exists():
-            output_path.unlink()
-    
+    # Remove from storage
     del task_storage[task_id]
     logger.info("Task deleted successfully", task_id=task_id)
+    
     return {"message": "Task deleted successfully", "task_id": task_id}
 
 @app.get("/tasks", summary="List All Tasks")
-async def list_tasks(status_filter: Optional[str] = None):
+async def list_tasks(
+    status_filter: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0
+):
+    """Paginated task listing"""
     tasks = list(task_storage.values())
     
+    # Apply status filter
     if status_filter:
         tasks = [t for t in tasks if t["status"] == status_filter]
+    
+    # Apply pagination
+    total = len(tasks)
+    tasks = tasks[offset:offset + limit]
+    
     return {
-        "total": len(tasks),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
         "tasks": tasks
+    }
+
+@app.get("/metrics", summary="System Metrics")
+async def get_metrics():
+    """System performance metrics"""
+    return {
+        "active_tasks": len([t for t in task_storage.values() if t["status"] == "processing"]),
+        "total_tasks": len(task_storage),
+        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+        "thread_pool_size": thread_pool._max_workers,
+        "active_threads": len(thread_pool._threads),
+        "task_ttl_seconds": TASK_TTL,
+        "uptime": time.time()
     }
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Optimized uvicorn configuration
     uvicorn.run(
         "api:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
+        workers=1,  # Use 1 worker with async/threading
         reload=False,
-        log_level="info"
+        log_level="info",
+        access_log=False,  # Disable access logs for performance
+        loop="asyncio",
+        http="httptools",  # Faster HTTP parser
+        lifespan="on"
     )
