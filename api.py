@@ -392,14 +392,32 @@ async def start_dubbing_task(
 
 @app.get("/task-status/{task_id}", response_model=TaskStatus, summary="Get Task Status")
 async def get_task_status(task_id: str):
-    """Fast task status lookup"""
+    """Fast task status lookup with better error handling"""
+    logger.info("Task status request", task_id=task_id)
+    
     if task_id not in task_storage:
+        # Log available task IDs for debugging
+        available_tasks = list(task_storage.keys())
+        logger.warning(
+            "Task not found", 
+            requested_task_id=task_id, 
+            available_tasks=available_tasks,
+            total_tasks=len(task_storage)
+        )
+        
+        # Provide helpful error message
+        if not available_tasks:
+            detail = "No tasks found. Please start a dubbing task first using the /dub-video endpoint."
+        else:
+            detail = f"Task '{task_id}' not found. Available task IDs: {', '.join(available_tasks[:5])}{'...' if len(available_tasks) > 5 else ''}"
+        
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Task not found"
+            detail=detail
         )
     
     task_data = task_storage[task_id]
+    logger.info("Task status retrieved", task_id=task_id, status=task_data["status"])
     return TaskStatus(**task_data)
 
 @app.get("/download/{task_id}", summary="Download Dubbed Video")
@@ -485,6 +503,40 @@ async def list_tasks(
         "limit": limit,
         "offset": offset,
         "tasks": tasks
+    }
+
+# NEW: Create a demo task endpoint for testing
+@app.post("/create-demo-task", summary="Create Demo Task for Testing")
+async def create_demo_task(task_id: Optional[str] = None):
+    """Create a demo task for testing purposes"""
+    if not task_id:
+        task_id = str(uuid.uuid4())
+    
+    # Check if task already exists
+    if task_id in task_storage:
+        return {
+            "message": f"Demo task {task_id} already exists",
+            "task_id": task_id,
+            "status": task_storage[task_id]["status"]
+        }
+    
+    # Create demo task
+    task_storage[task_id] = {
+        "task_id": task_id,
+        "status": "pending",
+        "message": "Demo task created for testing",
+        "progress": 0,
+        "target_language": "Hindi",
+        "filename": "demo_video.mp4",
+        "created_at": time.time()
+    }
+    
+    logger.info("Demo task created", task_id=task_id)
+    
+    return {
+        "message": f"Demo task created successfully",
+        "task_id": task_id,
+        "status": "pending"
     }
 
 @app.get("/metrics", summary="System Metrics")
