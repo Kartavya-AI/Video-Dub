@@ -21,7 +21,6 @@ import structlog
 
 from src.video_dubbing.crew import create_crew
 
-# Configure structured logging with better performance
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -107,8 +106,8 @@ async def cleanup_task_files(task_id: str):
 async def lifespan(app: FastAPI):
     logger.info("Starting Video Dubbing API", version="2.0.0")
     
-    # Validate environment variables
-    required_env_vars = ["ELEVENLABS_API_KEY"]
+    # Validate environment variables - UPDATED TO INCLUDE OPENAI_API_KEY
+    required_env_vars = ["ELEVENLABS_API_KEY", "OPENAI_API_KEY"]
     missing_vars = [var for var in required_env_vars if not os.getenv(var)]
     
     if missing_vars:
@@ -302,7 +301,8 @@ async def health_check():
 async def detailed_health_check():
     """Detailed health check with system info"""
     env_status = {}
-    required_vars = ["ELEVENLABS_API_KEY"]
+    # UPDATED TO INCLUDE OPENAI_API_KEY IN HEALTH CHECK
+    required_vars = ["ELEVENLABS_API_KEY", "OPENAI_API_KEY"]
     
     for var in required_vars:
         env_status[var] = "configured" if os.getenv(var) else "missing"
@@ -502,8 +502,6 @@ async def get_metrics():
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Optimized uvicorn configuration
     uvicorn.run(
         "api:app",
         host="0.0.0.0",

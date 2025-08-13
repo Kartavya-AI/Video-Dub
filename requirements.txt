@@ -16,4 +16,4 @@ SpeechRecognition
 elevenlabs
 pathlib2
 structlog
-gunicorn
+aiofiles
