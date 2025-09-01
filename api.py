@@ -74,6 +74,7 @@ class TaskStatus(BaseModel):
     created_at: float
     completed_at: Optional[float] = None
     error_message: Optional[str] = None
+    video_url: Optional[str] = Field(None, description="Download URL for completed video")
 
 async def cleanup_expired_tasks():
     """Background task to clean up expired tasks"""
@@ -321,7 +322,8 @@ async def process_dubbing_task(
                 "message": "Video dubbing completed successfully",
                 "progress": 100,
                 "output_path": str(final_output_path),
-                "completed_at": time.time()
+                "completed_at": time.time(),
+                "video_url": f"/download/{task_id}"  # Add the video_url here
             })
         
         logger.info("Dubbing process completed successfully", task_id=task_id)
@@ -333,7 +335,8 @@ async def process_dubbing_task(
                 "status": "failed",
                 "message": f"Dubbing failed: {str(e)}",
                 "error_message": str(e),
-                "completed_at": time.time()
+                "completed_at": time.time(),
+                "video_url": None
             })
 
 @app.get("/", summary="Health Check")
@@ -463,7 +466,6 @@ async def get_task_status(task_id: str):
         logger.info("Task status request", task_id=task_id)
         
         if task_id not in task_storage:
-            # Log available task IDs for debugging
             available_tasks = list(task_storage.keys())
             logger.warning(
                 "Task not found", 
@@ -471,8 +473,6 @@ async def get_task_status(task_id: str):
                 available_tasks=available_tasks,
                 total_tasks=len(task_storage)
             )
-            
-            # Provide helpful error message
             if not available_tasks:
                 detail = "No tasks found. Please start a dubbing task first using the /dub-video endpoint."
             else:
@@ -483,10 +483,13 @@ async def get_task_status(task_id: str):
                 detail=detail
             )
         
-        task_data = task_storage[task_id]
+        task_data = task_storage[task_id].copy()
         logger.info("Task status retrieved", task_id=task_id, status=task_data.get("status"))
-        
-        # Return task data directly - no conversion needed now
+
+        if task_data.get("status") == "completed" and task_data.get("output_path"):
+            task_data["video_url"] = f"/download/{task_id}"
+        else:
+            task_data["video_url"] = None
         return TaskStatus(**task_data)
     
     except HTTPException:
